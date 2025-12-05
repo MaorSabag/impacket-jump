@@ -163,34 +163,35 @@ def _split_share_path(share_path):
 
 class JUMP:
     def __init__(self, exeFile, port=445, username='', password='', domain='', hashes=None, aesKey=None, doKerberos=False, kdcHost=None, target='',
-                 serviceName='', serviceDisplayName='', serviceDescription=None, serviceArgs=None, remoteBinaryName=None, sharePath=''):
-        self._exeFile = exeFile
-        self._port = port
-        self._username = username
-        self._password = password
-        self._domain = domain
-        self._lmhash = ''
-        self._nthash = ''
-        self._aesKey = aesKey
-        self._doKerberos = doKerberos
-        self._kdcHost = kdcHost
-        self._target = target
-        self._serviceName = serviceName
-        self._serviceDisplayName = serviceDisplayName
-        self._serviceDescription = serviceDescription
-        self._serviceArgs = serviceArgs
-        self._remoteBinaryName = remoteBinaryName
-        self._sharePath = sharePath
+                 serviceName='', serviceDisplayName='', serviceDescription=None, serviceArgs=None, remoteBinaryName=None, sharePath='', pipeName=None):
+        self.__exeFile = exeFile
+        self.__port = port
+        self.__username = username
+        self.__password = password
+        self.__domain = domain
+        self.__lmhash = ''
+        self.__nthash = ''
+        self.__aesKey = aesKey
+        self.__doKerberos = doKerberos
+        self.__kdcHost = kdcHost
+        self.__target = target
+        self.__serviceName = serviceName
+        self.__serviceDisplayName = serviceDisplayName
+        self.__serviceDescription = serviceDescription
+        self.__serviceArgs = serviceArgs
+        self.__remoteBinaryName = remoteBinaryName
+        self.__sharePath = sharePath
+        self.__pipeName = pipeName
         if hashes is not None:
-            self._lmhash, self._nthash = hashes.split(':')
+            self.__lmhash, self.__nthash = hashes.split(':')
         
 
     def _configure_installer_for_share(self, installer):
-        if not self._sharePath:
+        if not self.__sharePath:
             return
 
-        share_name, share_subpath = _split_share_path(self._sharePath)
-        remote_relative_path = self._remoteBinaryName
+        share_name, share_subpath = _split_share_path(self.__sharePath)
+        remote_relative_path = self.__remoteBinaryName
         if share_subpath:
             remote_relative_path = f'{share_subpath}\\{remote_relative_path}'
 
@@ -212,9 +213,9 @@ class JUMP:
         # try to remove the uploaded binary with 3 tries
         for i in range(3):
             try:
-                share, remote_path = _parse_remote_path(self._sharePath, local_hint=self._remoteBinaryName)
-                connection.deleteFile(share, f"{remote_path}\\{self._remoteBinaryName}")
-                logging.info('Removed uploaded binary %s\\%s\\%s', share, remote_path, self._remoteBinaryName)
+                share, remote_path = _parse_remote_path(self.__sharePath, local_hint=self.__remoteBinaryName)
+                connection.deleteFile(share, f"{remote_path}\\{self.__remoteBinaryName}")
+                logging.info('Removed uploaded binary %s\\%s\\%s', share, remote_path, self.__remoteBinaryName)
                 break
             except Exception as cleanup_exc:
                 if i == 2:
@@ -222,15 +223,62 @@ class JUMP:
                 time.sleep(0.3)
 
 
+    def _read_from_pipe(self, remoteHost):
+        logging.info(f'Connecting to pipe {self.__pipeName} on {remoteHost}...')
+        try:
+            conn = SMBConnection(remoteHost, remoteHost, sess_port=self.__port)
+            if self.__doKerberos:
+                conn.kerberosLogin(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey, self.__kdcHost)
+            else:
+                conn.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
+            
+            tid = conn.connectTree('IPC$')
+            
+            fid = None
+            # Try for 10 seconds
+            for _ in range(20):
+                try:
+                    # FILE_READ_DATA = 1
+                    fid = conn.openFile(tid, self.__pipeName, 1, creationOption=0x40, fileAttributes=0x80)
+                    break
+                except Exception:
+                    time.sleep(0.5)
+            
+            if fid is None:
+                logging.error(f'Could not connect to pipe {self.__pipeName} after retries.')
+                conn.disconnect()
+                return
+
+            logging.info(f'Connected to pipe {self.__pipeName}. Reading output...')
+            
+            while True:
+                try:
+                    data = conn.readFile(tid, fid, 0, 1024)
+                    if len(data) == 0:
+                        break
+                    sys.stdout.write(data.decode('cp437', errors='replace'))
+                    sys.stdout.flush()
+                except SessionError as e:
+                    if e.getErrorCode() == 0xC000014B: # STATUS_PIPE_BROKEN
+                        break
+                    raise
+
+            conn.closeFile(tid, fid)
+            conn.disconnect()
+            
+        except Exception as e:
+             logging.error(f'Error reading from pipe: {e}')
+
+
     def create_service(self, remoteName, remoteHost):
         stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
         logging.debug('StringBinding %s' % stringbinding)
         rpctransport = transport.DCERPCTransportFactory(stringbinding)
-        rpctransport.set_dport(self._port)
+        rpctransport.set_dport(self.__port)
         rpctransport.setRemoteHost(remoteHost)
         if hasattr(rpctransport, 'set_credentials'):
-            rpctransport.set_credentials(self._username, self._password, self._domain, self._lmhash, self._nthash, self._aesKey)
-        rpctransport.set_kerberos(self._doKerberos, self._kdcHost)
+            rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+        rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
 
         dce = rpctransport.get_dce_rpc()
         smb_conn = None
@@ -241,12 +289,12 @@ class JUMP:
             smb_conn = rpctransport.get_smb_connection()
             smb_conn.setTimeout(100000)
 
-            with open(self._exeFile, 'rb') as f:
+            with open(self.__exeFile, 'rb') as f:
                 # first Upload the binary to the target system
-                logging.info('Uploading binary %s to target %s', self._exeFile, remoteHost)
-                if self._sharePath:
-                    share_name, share_subpath = _split_share_path(self._sharePath)
-                    remote_relative_path = self._remoteBinaryName
+                logging.info('Uploading binary %s to target %s', self.__exeFile, remoteHost)
+                if self.__sharePath:
+                    share_name, share_subpath = _split_share_path(self.__sharePath)
+                    remote_relative_path = self.__remoteBinaryName
                     if share_subpath:
                         remote_relative_path = f'{share_subpath}\\{remote_relative_path}'
 
@@ -266,9 +314,9 @@ class JUMP:
                     for share in shares:
                         share_name = share['shi1_netname'][:-1]
                         try:
-                            smb_conn.putFile(share_name, f'\\{self._remoteBinaryName}', f.read)
+                            smb_conn.putFile(share_name, f'\\{self.__remoteBinaryName}', f.read)
                             writable_share = share_name
-                            display_remote_path = f'{writable_share}\\{self._remoteBinaryName}'
+                            display_remote_path = f'{writable_share}\\{self.__remoteBinaryName}'
                             logging.info('Successfully uploaded binary to %s', display_remote_path)
                             break
                         except Exception:
@@ -284,26 +332,26 @@ class JUMP:
                 service_handle = scmr.hRCreateServiceW(
                     dce=dce,
                     hSCManager=svc_manager,
-                    lpServiceName=self._serviceName + '\x00',
-                    lpDisplayName=self._serviceDisplayName + '\x00',
+                    lpServiceName=self.__serviceName + '\x00',
+                    lpDisplayName=self.__serviceDisplayName + '\x00',
                     lpBinaryPathName=f'\\\\{remoteHost}\\{display_remote_path}\x00',
                     dwStartType=scmr.SERVICE_DEMAND_START
                 )['lpServiceHandle']
 
-                logging.info(f'Created service {self._serviceName} (manual start) referencing \\\\{remoteHost}\\{display_remote_path}')
+                logging.info(f'Created service {self.__serviceName} (manual start) referencing \\\\{remoteHost}\\{display_remote_path}')
 
-                if self._serviceDescription:
+                if self.__serviceDescription:
                     # Change service description
                     hRChangeServiceConfig2W(
                         dce,
                         service_handle,
                         scmr.SERVICE_CONFIG_DESCRIPTION,
-                        self._serviceDescription + '\x00'
+                        self.__serviceDescription + '\x00'
                     )
 
             except Exception as create_exc:
                 logging.error('Failed to create service on %s: %s', remoteHost, create_exc)
-                self._remove_uploaded_binary(smb_conn)
+                self.__remove_uploaded_binary(smb_conn)
                 raise
             finally:
                 if service_handle is not None:
@@ -311,7 +359,7 @@ class JUMP:
                 scmr.hRCloseServiceHandle(dce, svc_manager)     
  
         except FileNotFoundError:
-            logging.critical('The specified executable file %s was not found.', self._exeFile)
+            logging.critical('The specified executable file %s was not found.', self.__exeFile)
             sys.exit(1)
         except Exception as e:
             if '_remove_uploaded_binary' in locals():
@@ -335,11 +383,11 @@ class JUMP:
         stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
         logging.debug('StringBinding %s' % stringbinding)
         rpctransport = transport.DCERPCTransportFactory(stringbinding)
-        rpctransport.set_dport(self._port)
+        rpctransport.set_dport(self.__port)
         rpctransport.setRemoteHost(remoteHost)
         if hasattr(rpctransport, 'set_credentials'):
-            rpctransport.set_credentials(self._username, self._password, self._domain, self._lmhash, self._nthash, self._aesKey)
-        rpctransport.set_kerberos(self._doKerberos, self._kdcHost)
+            rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+        rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
 
         dce = rpctransport.get_dce_rpc()
         try:
@@ -348,21 +396,24 @@ class JUMP:
             svc_manager = scmr.hROpenSCManagerW(dce)['lpScHandle']
             service_handle = None
             try:
-                resp = scmr.hROpenServiceW(dce, svc_manager, self._serviceName + '\x00')
+                resp = scmr.hROpenServiceW(dce, svc_manager, self.__serviceName + '\x00')
             except Exception as exc:
                 scmr.hRCloseServiceHandle(dce, svc_manager)
-                logging.error('Failed opening service %s: %s', self._serviceName, exc)
+                logging.error('Failed opening service %s: %s', self.__serviceName, exc)
                 sys.exit(1)
 
             service_handle = resp['lpServiceHandle']
             try:
-                if self._serviceArgs:
-                    args_list = self._serviceArgs.split()
+                if self.__serviceArgs:
+                    args_list = self.__serviceArgs.split()
                     scmr.hRStartServiceW(dce, service_handle, len(args_list), args_list)
                 else:
                     scmr.hRStartServiceW(dce, service_handle)
                     
-                logging.info(f'Service {self._serviceName} started successfully on {remoteHost}')
+                logging.info(f'Service {self.__serviceName} started successfully on {remoteHost}')
+
+                if self.__pipeName:
+                    self._read_from_pipe(remoteHost)
 
             except Exception as start_exc:
                 logging.error('Failed to start service on %s: %s', remoteHost, start_exc)
@@ -392,11 +443,11 @@ class JUMP:
             stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
             logging.debug('StringBinding %s' % stringbinding)
             rpctransport = transport.DCERPCTransportFactory(stringbinding)
-            rpctransport.set_dport(self._port)
+            rpctransport.set_dport(self.__port)
             rpctransport.setRemoteHost(remoteHost)
             if hasattr(rpctransport, 'set_credentials'):
-                rpctransport.set_credentials(self._username, self._password, self._domain, self._lmhash, self._nthash, self._aesKey)
-            rpctransport.set_kerberos(self._doKerberos, self._kdcHost)
+                rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+            rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
 
             dce = rpctransport.get_dce_rpc()
             dce.connect()
@@ -405,20 +456,20 @@ class JUMP:
             svc_manager = scmr.hROpenSCManagerW(dce)['lpScHandle']
             service_handle = None
             try:
-                resp = scmr.hROpenServiceW(dce, svc_manager, self._serviceName + '\x00')
+                resp = scmr.hROpenServiceW(dce, svc_manager, self.__serviceName + '\x00')
             except Exception as exc:
                 scmr.hRCloseServiceHandle(dce, svc_manager)
-                logging.error('Failed opening service %s: %s', self._serviceName, exc)
+                logging.error('Failed opening service %s: %s', self.__serviceName, exc)
                 sys.exit(1)
 
             # Stop the service
             service_handle = resp['lpServiceHandle']
             try:
                 scmr.hRControlService(dce, service_handle, scmr.SERVICE_CONTROL_STOP)
-                logging.info(f'Service {self._serviceName} stopped successfully on {remoteHost}')
+                logging.info(f'Service {self.__serviceName} stopped successfully on {remoteHost}')
             except Exception as delete_exc:
                 if 'code: 0x426' in str(delete_exc):
-                    logging.info(f'Service {self._serviceName} is not running on {remoteHost}')
+                    logging.info(f'Service {self.__serviceName} is not running on {remoteHost}')
                 else:
                     logging.error('Failed to delete service on %s: %s', remoteHost, delete_exc)
             finally:
@@ -440,11 +491,11 @@ class JUMP:
             stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
             logging.debug('StringBinding %s' % stringbinding)
             rpctransport = transport.DCERPCTransportFactory(stringbinding)
-            rpctransport.set_dport(self._port)
+            rpctransport.set_dport(self.__port)
             rpctransport.setRemoteHost(remoteHost)
             if hasattr(rpctransport, 'set_credentials'):
-                rpctransport.set_credentials(self._username, self._password, self._domain, self._lmhash, self._nthash, self._aesKey)
-            rpctransport.set_kerberos(self._doKerberos, self._kdcHost)
+                rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+            rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
 
             dce = rpctransport.get_dce_rpc()
             dce.connect()
@@ -453,16 +504,16 @@ class JUMP:
             svc_manager = scmr.hROpenSCManagerW(dce)['lpScHandle']
             service_handle = None
             try:
-                resp = scmr.hROpenServiceW(dce, svc_manager, self._serviceName + '\x00')
+                resp = scmr.hROpenServiceW(dce, svc_manager, self.__serviceName + '\x00')
             except Exception as exc:
                 scmr.hRCloseServiceHandle(dce, svc_manager)
-                logging.error('Failed opening service %s: %s', self._serviceName, exc)
+                logging.error('Failed opening service %s: %s', self.__serviceName, exc)
                 sys.exit(1)
             # Delete the service
             service_handle = resp['lpServiceHandle']
             try:
                 scmr.hRDeleteService(dce, service_handle)
-                logging.info(f'Service {self._serviceName} deleted successfully on {remoteHost}')
+                logging.info(f'Service {self.__serviceName} deleted successfully on {remoteHost}')
             except Exception as delete_exc:
                 logging.error('Failed to delete service on %s: %s', remoteHost, delete_exc)
             finally:
@@ -483,11 +534,11 @@ class JUMP:
         stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
         logging.debug('StringBinding %s' % stringbinding)
         rpctransport = transport.DCERPCTransportFactory(stringbinding)
-        rpctransport.set_dport(self._port)
+        rpctransport.set_dport(self.__port)
         rpctransport.setRemoteHost(remoteHost)
         if hasattr(rpctransport, 'set_credentials'):
-            rpctransport.set_credentials(self._username, self._password, self._domain, self._lmhash, self._nthash, self._aesKey)
-        rpctransport.set_kerberos(self._doKerberos, self._kdcHost)
+            rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+        rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
 
         dce = rpctransport.get_dce_rpc()
         dce.connect()
@@ -501,11 +552,11 @@ class JUMP:
         stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
         logging.debug('StringBinding %s' % stringbinding)
         rpctransport = transport.DCERPCTransportFactory(stringbinding)
-        rpctransport.set_dport(self._port)
+        rpctransport.set_dport(self.__port)
         rpctransport.setRemoteHost(remoteHost)
         if hasattr(rpctransport, 'set_credentials'):
-            rpctransport.set_credentials(self._username, self._password, self._domain, self._lmhash, self._nthash, self._aesKey)
-        rpctransport.set_kerberos(self._doKerberos, self._kdcHost)
+            rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+        rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
 
         dce = rpctransport.get_dce_rpc()
         try:
@@ -514,10 +565,10 @@ class JUMP:
             svc_manager = scmr.hROpenSCManagerW(dce)['lpScHandle']
             service_handle = None
             try:
-                resp = scmr.hROpenServiceW(dce, svc_manager, self._serviceName + '\x00', scmr.SERVICE_QUERY_CONFIG)
+                resp = scmr.hROpenServiceW(dce, svc_manager, self.__serviceName + '\x00', scmr.SERVICE_QUERY_CONFIG)
             except Exception as exc:
                 scmr.hRCloseServiceHandle(dce, svc_manager)
-                logging.error('Failed opening service %s: %s', self._serviceName, exc)
+                logging.error('Failed opening service %s: %s', self.__serviceName, exc)
                 sys.exit(1)
 
             service_handle = resp['lpServiceHandle']
@@ -543,7 +594,7 @@ class JUMP:
         
     def print_service_info(self, remoteName, remoteHost):
         config: scmr.QUERY_SERVICE_CONFIGW = self._get_service_info(remoteName, remoteHost)
-        logging.info('Service Name: %s', self._serviceName)
+        logging.info('Service Name: %s', self.__serviceName)
         logging.info('Display Name: %s', config['lpDisplayName'][:-1])
         logging.info('Binary Path: %s', config['lpBinaryPathName'][:-1])
         logging.info('Service Type: %s', service_types.get(config['dwServiceType'], 'UNKNOWN'))
@@ -555,12 +606,11 @@ class JUMP:
         stringbinding = r'ncacn_np:%s[\pipe\svcctl]' % remoteName
         logging.debug('StringBinding %s' % stringbinding)
         rpctransport = transport.DCERPCTransportFactory(stringbinding)
-        rpctransport.set_dport(self._port)
+        rpctransport.set_dport(self.__port)
         rpctransport.setRemoteHost(remoteHost)
         if hasattr(rpctransport, 'set_credentials'):
-            rpctransport.set_credentials(self._username, self._password, self._domain, self._lmhash, self._nthash, self._aesKey)
-        rpctransport.set_kerberos(self._doKerberos, self._kdcHost)
-
+            rpctransport.set_credentials(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash, self.__aesKey)
+        rpctransport.set_kerberos(self.__doKerberos, self.__kdcHost)
         dce = rpctransport.get_dce_rpc()
         try:
             dce.connect()
@@ -568,35 +618,35 @@ class JUMP:
             svc_manager = scmr.hROpenSCManagerW(dce)['lpScHandle']
             service_handle = None
             try:
-                resp = scmr.hROpenServiceW(dce, svc_manager, self._serviceName + '\x00', scmr.SERVICE_CHANGE_CONFIG)
+                resp = scmr.hROpenServiceW(dce, svc_manager, self.__serviceName + '\x00', scmr.SERVICE_CHANGE_CONFIG)
             except Exception as exc:
                 scmr.hRCloseServiceHandle(dce, svc_manager)
-                logging.error('Failed opening service %s: %s', self._serviceName, exc)
+                logging.error('Failed opening service %s: %s', self.__serviceName, exc)
                 sys.exit(1)
 
             service_handle = resp['lpServiceHandle']
             try:
                 # Currently only service description change is implemented
-                if self._serviceDescription:
+                if self.__serviceDescription:
                     hRChangeServiceConfig2W(
                         dce,
                         service_handle,
                         scmr.SERVICE_CONFIG_DESCRIPTION,
-                        self._serviceDescription + '\x00'
+                        self.__serviceDescription + '\x00'
                     )
-                    logging.info(f'Service {self._serviceName} description changed successfully on {remoteHost}')
+                    logging.info(f'Service {self.__serviceName} description changed successfully on {remoteHost}')
                 
-                if self._serviceDisplayName or self._serviceName:
+                if self.__serviceDisplayName or self.__serviceName:
                     scmr.hRChangeServiceConfigW(
                         dce=dce,
                         hService=service_handle,
-                        lpDisplayName=(self._serviceDisplayName + '\x00') if self._serviceDisplayName else None,
+                        lpDisplayName=(self.__serviceDisplayName + '\x00') if self.__serviceDisplayName else None,
                         dwServiceType=scmr.SERVICE_NO_CHANGE,
                         dwStartType=scmr.SERVICE_NO_CHANGE,
                         dwErrorControl=scmr.SERVICE_NO_CHANGE,
-                        lpBinaryPathName=self._remoteBinaryName if self._remoteBinaryName else None,
+                        lpBinaryPathName=self.__remoteBinaryName if self.__remoteBinaryName else None,
                     )
-                    logging.info(f'Service {self._serviceName} configuration changed successfully on {remoteHost}')
+                    logging.info(f'Service {self.__serviceName} configuration changed successfully on {remoteHost}')
             except Exception as change_exc:
                 logging.error('Failed to change service on %s: %s', remoteHost, change_exc)
                 raise
@@ -639,6 +689,7 @@ def main():
     group.add_argument('-service-display-name', action='store', default='Impacket Jump Service', help='Display name of the service to create (default: Impacket Jump Service)')
     group.add_argument('-service-description', action='store', help='Description of the service to create (default: Impacket Jump Service created by impacket-jump.py)')
     group.add_argument('-service-args', action='store', default='', help='Arguments to pass to the service executable when starting the service')
+    group.add_argument('-pipe', action='store', help='Named pipe to read stdout from (e.g. "mypipe")')
     group.add_argument('-remote-binary-name', action='store', default='Jump.exe', help='Name of the binary once uploaded to the target (default: same as local file name)')
     group.add_argument('-share-path', action='store', metavar='share_path', default=None, help='Remote share and path where the service executable will be uploaded in the format <SHARE_NAME>\\path\\to\\file.exe (default: (default: searching for writable share)')
     group.add_argument('-create', action=argparse.BooleanOptionalAction, default=False, help='Create the service on the target system (default: False)')
@@ -696,7 +747,8 @@ def main():
         serviceDescription=options.service_description,
         serviceArgs=options.service_args,
         remoteBinaryName=options.remote_binary_name,
-        sharePath=options.share_path
+        sharePath=options.share_path,
+        pipeName=options.pipe
     )
 
     if options.create:
