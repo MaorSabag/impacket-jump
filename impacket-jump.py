@@ -246,7 +246,7 @@ class JUMP:
             
             if fid is None:
                 logging.error(f'Could not connect to pipe {self.__pipeName} after retries.')
-                conn.disconnect()
+                conn.logoff()
                 return
 
             logging.info(f'Connected to pipe {self.__pipeName}. Reading output...')
@@ -259,14 +259,15 @@ class JUMP:
                     sys.stdout.write(data.decode('cp437', errors='replace'))
                     sys.stdout.flush()
                 except SessionError as e:
-                    if e.getErrorCode() == 0xC000014B: # STATUS_PIPE_BROKEN
+                    if e.getErrorCode() == 0xC000014B or e.getErrorCode() == 0xc00000b0: # STATUS_PIPE_BROKEN or STATUS_PIPE_DISCONNECTED
                         break
                     raise
 
             conn.closeFile(tid, fid)
-            conn.disconnect()
+            conn.logoff()
             
         except Exception as e:
+             
              logging.error(f'Error reading from pipe: {e}')
 
 
